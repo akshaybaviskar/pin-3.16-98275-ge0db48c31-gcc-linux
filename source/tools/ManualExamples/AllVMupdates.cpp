@@ -256,7 +256,7 @@ VOID ThreadFini(THREADID tid, const CONTEXT *ctxt, INT32 code, VOID *v) {
 // Pin calls this function every time a new basic block is encountered
 VOID Trace(TRACE trace, VOID *v) {
 
-    for(BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl=BBL_Next(bbl)) {
+ /*   for(BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl=BBL_Next(bbl)) {
         // Insert a call to AccumulateTotalIns before every bbl,
         // passing the number of instructions
         BBL_InsertCall(bbl, IPOINT_ANYWHERE, (AFUNPTR)AccumulateTotalIns,
@@ -322,7 +322,7 @@ VOID Trace(TRACE trace, VOID *v) {
             }
 			}
 		}
-    }
+    }*/
 }
 
 /* ===================================================================== */
@@ -350,9 +350,15 @@ VOID SyscallExit(THREADID tid, CONTEXT *ctxt, SYSCALL_STANDARD std, VOID *v) {
  
      // filename<<KnobOutputFile.Value()<<"/vma_"<<vma_cnt;
       filename<<outputfileval.substr(0,pos)<<"/VMAs/vma_"<<vma_cnt;
+      //cout<<filename.str()<<endl;
       mlog->output_file<<"vma_"<<dec<<vma_cnt<<endl;
       vma_cnt++;
       ofstream opfile(filename.str().c_str());
+
+      if(opfile.is_open() == false)
+      {
+         cout<<"unable to open "<<filename.str()<<endl;
+      }
       ss<<"/bin/cat /proc/"<<PIN_GetPid()<<"/maps";
 
       FILE* opp = popen(ss.str().c_str(),"r");
@@ -363,7 +369,9 @@ VOID SyscallExit(THREADID tid, CONTEXT *ctxt, SYSCALL_STANDARD std, VOID *v) {
       while((read = getline(&line, &len, opp)) != -1)
       {
          opfile<<line;
+        // cout<<line;
       }
+      opfile.close();
    }
 
 /*	if ((mlog->syscall_num == SYS_mmap) || (mlog->syscall_num == SYS_munmap)) {
