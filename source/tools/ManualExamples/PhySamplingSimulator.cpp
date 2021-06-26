@@ -59,6 +59,10 @@ typedef struct {
    unsigned int present : 1;
 } PagemapEntry;
 
+typedef struct { 
+   unsigned int huge : 1;
+   unsigned int thp : 1; 
+} PageflagEntry;
 
 #define	WARMUP_TO_RECORD_LOG	(ADDRINT)0xdeadbeefdeadbeef
 #define	RECORD_TO_WARMUP_LOG	(ADDRINT)0xbeefdeadbeefdead
@@ -80,7 +84,8 @@ KNOB<UINT64> KnobSampleRate(KNOB_MODE_WRITEONCE, "pintool",
       "r", "10", "specify log2 of the samples rate to trace");
 UINT64 sample_rate = 0ul;
 
-FILE *pagemap_fptr;// = fopen(pagemap_file, "rb");
+FILE *pagemap_fptr;
+FILE *kpageflags_fptr;
 #if 1
 // The ID of the buffer
 BUFFER_ID buffer_id;
@@ -91,40 +96,61 @@ int vma_cnt = 1;
 TLS_KEY mlog_key;
 PIN_LOCK lock;
 
-int get_page_frame_number_of_address(PagemapEntry *entry, intptr_t vaddr) {
+/* Parse the pagemap entry for the given virtual address.
+ *
+ * @param[out] entry      the parsed entry
+ * @param[in]  pagemap_fd file descriptor to an open /proc/kpageflags file
+ * @param[in]  pfn        pfn to read flags for
+ * @return 0 for success, 1 for failure
+ */
+int pageflag_get_entry(PageflagEntry *entry, uintptr_t pfn) 
+{ 
+    uint64_t flags = 0; 
+    unsigned long offset = (unsigned long)pfn * PAGEMAP_LENGTH;
+
+   if(fseek(kpageflags_fptr, (unsigned long)offset, SEEK_SET) != 0) {
+      fprintf(stderr, "Failed to seek pagemap to proper location\n");
+      return 1;
+   }
+
+   fread(&flags, 1, PAGEMAP_LENGTH-1, kpageflags_fptr);
+   if(ferror(kpageflags_fptr))
+   {
+      fprintf(stderr, "Error while reading pagemap.\n");
+      return 1;
+   }
+
+   entry->huge = (flags >> 17) & 1;
+   entry->thp = (flags >> 22) & 1;
+   return 0;
+}
+
+//return 0 if success, else 1
+int vpn_to_pfn(PagemapEntry *entry, intptr_t vaddr) {
 
    unsigned long offset = (unsigned long)vaddr / sysconf(_SC_PAGESIZE) * PAGEMAP_LENGTH;
-   //  fseek(pagemap_fptr, (unsigned long)0, SEEK_SET);
-   // cout<<"Currently at :"<<ftell(pagemap_fptr)<<endl;
-   //  cout<<hex<<offset<<endl;
+
    if(fseek(pagemap_fptr, (unsigned long)offset, SEEK_SET) != 0) {
       fprintf(stderr, "Failed to seek pagemap to proper location\n");
-      exit(1);
+      return 1;
    }
 
    uint64_t page_frame_number = 0;
    fread(&page_frame_number, 1, PAGEMAP_LENGTH-1, pagemap_fptr);
+   if(ferror(pagemap_fptr))
+   {
+      fprintf(stderr, "Error while reading pagemap.\n");
+      return 1;
+   }
    page_frame_number &= 0x7FFFFFFFFFFFFF;
-
-   /*  cout<<"Before Reset to  :"<<ftell(pagemap_fptr)<<endl;
-       if(fseek(pagemap_fptr, (unsigned long)0, SEEK_SET) != 0) {
-       fprintf(stderr, "Failed to seek pagemap to location\n");
-       exit(1);
-       }
-       cout<<"Reset to  :"<<ftell(pagemap_fptr)<<endl;*/
 
    entry->pfn = page_frame_number;
    return 0;
 }
-int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr)
-{
-   // pagemap_fd = open(pagemap_file, O_RDONLY);
-   //  if (pagemap_fd < 0) {
-   //    return 1;
-   //  }
-   PagemapEntry entry;
 
-   //FILE *pagemap_fptr = fopen(pagemap_file, "rb");
+int virt_to_phys_user(uintptr_t *paddr, uintptr_t vaddr)
+{
+   PagemapEntry entry;
 
    if(pagemap_fptr == NULL)
    {
@@ -132,8 +158,7 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr)
       return 1;
    }
 
-   //if (pagemap_get_entry(&entry, pagemap_fd, vaddr)) {
-   if (get_page_frame_number_of_address(&entry, vaddr)) {
+   if (vpn_to_pfn(&entry, vaddr)) {
       return 1;
    }
    *paddr = (entry.pfn * sysconf(_SC_PAGE_SIZE)) + (vaddr % sysconf(_SC_PAGE_SIZE));
@@ -293,27 +318,26 @@ VOID* BufferFull(BUFFER_ID buffer_id, THREADID tid, const CONTEXT *ctxt,
          //Code to collect PFN and huge page info
          uint64_t vaddr = buffer_start[i];
          uint64_t paddr = 0;
-         pid_t pid;
-         //PageflagEntry entry;
+         PageflagEntry entry;
 
-         pid = PIN_GetPid();
-         if(virt_to_phys_user(&paddr, pid, vaddr))
+         if(virt_to_phys_user(&paddr, vaddr))
          {
             cout<<"failed to get pfn"<<endl;
             exit(-1);
          }
-         /*
-            if(1 || get_pfn_flags(&entry, paddr))
-            {
+         
+         uint64_t pfn = paddr >> 12;
+         if(pageflag_get_entry(&entry, pfn))
+         {
             cout<<"failed to get flag info"<<endl;
             exit(-1);
-            }
+         }
 
-            bool is_huge = entry.huge || entry.thp;
-          */
+         bool is_huge = entry.huge || entry.thp;
+          
          // Record memory access in the core
          //cout<<hex<<buffer_start[i]<<endl;
-         mlog->output_file<<hex<<setfill('0')<<setw(16)<<buffer_start[i]<<" "<<paddr<<endl;
+         mlog->output_file<<hex<<setfill('0')<<setw(16)<<buffer_start[i]<<" "<<paddr<<" "<<is_huge<<endl;
          //			mlog->core.RecordMemoryAccess(buffer_start[i]);
       }
       PIN_ReleaseLock(&lock);
@@ -494,6 +518,7 @@ int main(int argc, char *argv[]) {
    // ADDRINT		-	defined at pin.H
    //TODO: check this and enable it : assert((bool)(std::is_same<uint64_t, ADDRINT>::value));
    char pagemap_file[BUFSIZ];
+   char pageflags_file[BUFSIZ];
    //int pagemap_fd;
    pid_t pid;
    //PageflagEntry entry;
@@ -503,7 +528,10 @@ int main(int argc, char *argv[]) {
    snprintf(pagemap_file, sizeof(pagemap_file), "/proc/%ju/pagemap", (uintmax_t)pid);
    pagemap_fptr = fopen(pagemap_file, "rb");
 
-   // Initialize the pin lock
+   snprintf(pageflags_file, sizeof(pageflags_file), "/proc/kpageflags");
+   kpageflags_fptr = fopen(pageflags_file, "rb");
+
+  // Initialize the pin lock
    PIN_InitLock(&lock);
 
    // Initialize pin
