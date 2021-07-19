@@ -44,10 +44,9 @@ END_LEGAL */
 #include <cassert>
 #include <syscall.h>
 #include <sys/mman.h>
+#include <errno.h>
 
 #include "pin.H"
-//#include "Common/Common.h"
-//#include "Common/Stopwatch.hh"
 
 #define PAGEMAP_LENGTH 8
 
@@ -86,6 +85,7 @@ UINT64 sample_rate = 0ul;
 
 FILE *pagemap_fptr;
 FILE *kpageflags_fptr;
+FILE *kpagecount_fptr;
 #if 1
 // The ID of the buffer
 BUFFER_ID buffer_id;
@@ -96,23 +96,43 @@ int vma_cnt = 1;
 TLS_KEY mlog_key;
 PIN_LOCK lock;
 
+uint64_t get_pagecount(uintptr_t pfn) 
+{ 
+   unsigned long offset = (unsigned long)pfn * PAGEMAP_LENGTH;
+   uint64_t count = 0;
+
+   if(fseek(kpagecount_fptr, (unsigned long)offset, SEEK_SET) != 0) {
+      fprintf(stderr, "Failed to seek pagemap to proper location\n");
+      return 1;
+   }
+
+   fread(&count, 1, PAGEMAP_LENGTH, kpagecount_fptr);
+   if(ferror(kpagecount_fptr))
+   {
+      fprintf(stderr, "Error while reading pagemap.\n");
+      return 1;
+   }
+
+   return count;
+}
+
+
 /* Parse the pagemap entry for the given virtual address.
  *
  * @param[out] entry      the parsed entry
- * @param[in]  pagemap_fd file descriptor to an open /proc/kpageflags file
  * @param[in]  pfn        pfn to read flags for
  * @return 0 for success, 1 for failure
  */
-int pageflag_get_entry(PageflagEntry *entry, uintptr_t pfn) 
+int pageflag_get_entry(PageflagEntry *entry, uintptr_t paddr) 
 { 
-    uint64_t flags = 0; 
-    unsigned long offset = (unsigned long)pfn * PAGEMAP_LENGTH;
+    unsigned long offset = (unsigned long)paddr / sysconf(_SC_PAGESIZE) * PAGEMAP_LENGTH;
 
    if(fseek(kpageflags_fptr, (unsigned long)offset, SEEK_SET) != 0) {
       fprintf(stderr, "Failed to seek pagemap to proper location\n");
       return 1;
    }
 
+   uint64_t flags = 0; 
    fread(&flags, 1, PAGEMAP_LENGTH-1, kpageflags_fptr);
    if(ferror(kpageflags_fptr))
    {
@@ -315,6 +335,7 @@ VOID* BufferFull(BUFFER_ID buffer_id, THREADID tid, const CONTEXT *ctxt,
             continue;
          }			
 
+         #if 1
          //Code to collect PFN and huge page info
          uint64_t vaddr = buffer_start[i];
          uint64_t paddr = 0;
@@ -327,18 +348,20 @@ VOID* BufferFull(BUFFER_ID buffer_id, THREADID tid, const CONTEXT *ctxt,
          }
          
          uint64_t pfn = paddr >> 12;
-         if(pageflag_get_entry(&entry, pfn))
+         if(pageflag_get_entry(&entry, paddr))
          {
             cout<<"failed to get flag info"<<endl;
             exit(-1);
          }
 
          bool is_huge = entry.huge || entry.thp;
-          
-         // Record memory access in the core
-         //cout<<hex<<buffer_start[i]<<endl;
-         mlog->output_file<<hex<<setfill('0')<<setw(16)<<buffer_start[i]<<" "<<paddr<<" "<<is_huge<<endl;
-         //			mlog->core.RecordMemoryAccess(buffer_start[i]);
+   //       
+   //      // Record memory access in the core
+         mlog->output_file<<hex<<setfill('0')<<setw(16)<<buffer_start[i]<<" "<<paddr<<" "<<is_huge<<" ";
+         mlog->output_file<<dec<<get_pagecount(pfn)<<endl;;
+   //      #else
+   //      mlog->output_file<<hex<<setfill('0')<<setw(16)<<buffer_start[i]<<endl;
+         #endif
       }
       PIN_ReleaseLock(&lock);
    }
@@ -428,13 +451,14 @@ VOID Trace(TRACE trace, VOID *v) {
             }
             // Record this virtual address in the buffer only when we need to sample
             if (INS_MemoryOperandIsWritten(ins, memOp))
-            {  	INS_InsertIfPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)IsSample,
-                  IARG_FAST_ANALYSIS_CALL,
-                  IARG_THREAD_ID,
-                  IARG_END);
-            INS_InsertFillBufferThen(ins, IPOINT_BEFORE, buffer_id,
-                  IARG_MEMORYOP_EA, memOp, 0,
-                  IARG_END);
+            {  	
+               INS_InsertIfPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)IsSample,
+                     IARG_FAST_ANALYSIS_CALL,
+                     IARG_THREAD_ID,
+                     IARG_END);
+               INS_InsertFillBufferThen(ins, IPOINT_BEFORE, buffer_id,
+                     IARG_MEMORYOP_EA, memOp, 0,
+                     IARG_END);
             }
          }
       }
@@ -481,22 +505,6 @@ VOID SyscallExit(THREADID tid, CONTEXT *ctxt, SYSCALL_STANDARD std, VOID *v) {
          opfile<<line;
       }
    }
-
-   /*	if ((mlog->syscall_num == SYS_mmap) || (mlog->syscall_num == SYS_munmap)) {
-   //	UINT64 addr = mlog->syscall_arg0;
-   if (mlog->syscall_num == SYS_mmap){}
-   // mmap syscall returns the address where space is allocated
-   //		addr = PIN_GetSyscallReturn(ctxt, std);
-   // 	UINT64 length = mlog->syscall_arg1;
-
-   PIN_GetLock(&lock, tid+1);	// the page table is shared between all threads.
-   if (mlog->syscall_num == SYS_mmap) {
-   //	page_table.AddMapping(addr, length);
-   } else if (mlog->syscall_num == SYS_munmap) {
-   //	page_table.RemoveMapping(addr, length);
-   }
-   PIN_ReleaseLock(&lock);
-   }*/
 }
 
 #endif
@@ -519,25 +527,46 @@ int main(int argc, char *argv[]) {
    //TODO: check this and enable it : assert((bool)(std::is_same<uint64_t, ADDRINT>::value));
    char pagemap_file[BUFSIZ];
    char pageflags_file[BUFSIZ];
+   char pagecount_file[BUFSIZ];
    //int pagemap_fd;
    pid_t pid;
    //PageflagEntry entry;
-
+   errno = 0;
    pid = PIN_GetPid();
 
    snprintf(pagemap_file, sizeof(pagemap_file), "/proc/%ju/pagemap", (uintmax_t)pid);
    pagemap_fptr = fopen(pagemap_file, "rb");
 
+   if(!pagemap_fptr)
+   {
+      printf("unable to open %s \n", pagemap_file);
+      exit(-1);
+   }
+
    snprintf(pageflags_file, sizeof(pageflags_file), "/proc/kpageflags");
    kpageflags_fptr = fopen(pageflags_file, "rb");
+   auto x = errno;
+   printf("kpageflags_ptr = %p , errno = %d \n", kpageflags_fptr, x);
+   if(!kpageflags_fptr)
+   {
+      printf("unable to open %s error: %d\n", pageflags_file, errno);
+      exit(-1);
+   }
 
-  // Initialize the pin lock
+   snprintf(pagecount_file, sizeof(pagecount_file), "/proc/kpagecount");
+   kpagecount_fptr = fopen(pagecount_file, "rb");
+   if(!kpagecount_fptr)
+   {
+      printf("unable to open %s \n", pagecount_file);
+      exit(-1);
+   }
+
+ // Initialize the pin lock
    PIN_InitLock(&lock);
 
    // Initialize pin
    if (PIN_Init(argc, argv)) return Usage();
 
-#if 1
    detach_limit = KnobDetachLimit.Value();
    sample_block_log2 = KnobSampleBlockLog2.Value();
    sample_rate = KnobSampleRate.Value();
@@ -568,7 +597,8 @@ int main(int argc, char *argv[]) {
    // Never returns
    PIN_StartProgram();
    fclose(pagemap_fptr);
-#endif
+   fclose(kpageflags_fptr);
+   fclose(kpagecount_fptr);
 
    return 0;
 }
